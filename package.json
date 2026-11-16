@@ -10,7 +10,10 @@
   },
   "dependencies": {
     "@changey/react-leaflet-markercluster": "^4.0.0-rc1",
+    "@copilotkit/react-core": "^1.83.0",
+    "@copilotkit/react-ui": "^1.83.0",
     "axios": "^1.6.0",
+    "install": "^0.13.0",
     "leaflet": "^1.9.4",
     "leaflet.markercluster": "^1.5.3",
     "lucide-react": "^1.7.0",

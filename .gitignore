@@ -1,6 +1,21 @@
+
 node_modules/
 dist/
+
+# Environment variables and secrets
 .env
+.env.*
+!.env.example
 backend/.env
 **/.env
+
+# Uploaded complaint images
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Accidental nested project folder
+/Public_Issue_Tracker/
+
+# Operating system files
 .DS_Store
+Thumbs.db

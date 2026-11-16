@@ -1,3 +1,4 @@
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -111,6 +112,86 @@ app.get('/api/auth/me', auth(), async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ADDRESS GEOCODING API
+// Converts an address into latitude and longitude
+// Uses OpenStreetMap Nominatim
+// ═══════════════════════════════════════════════════════════════════════════
+
+let lastGeocodeRequestAt = 0;
+
+app.get('/api/geocode', async (req, res) => {
+  try {
+    const address = String(req.query.q || '').trim();
+
+    if (address.length < 3) {
+      return res.status(400).json({
+        error: 'Please enter an address with at least 3 characters.'
+      });
+    }
+
+    // Respect the public Nominatim usage policy.
+    const waitMs = Math.max(0, 1100 - (Date.now() - lastGeocodeRequestAt));
+
+    if (waitMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+
+    lastGeocodeRequestAt = Date.now();
+
+    const searchParams = new URLSearchParams({
+      q: address,
+      format: 'jsonv2',
+      limit: '5',
+      addressdetails: '1',
+      countrycodes: 'in'
+    });
+
+    const response = await fetch(
+      `https://nominatim.openstreetmap.org/search?${searchParams.toString()}`,
+      {
+        headers: {
+          'User-Agent': 'CivicTrack/1.0 (public issue reporting application)',
+          'Accept': 'application/json'
+        },
+        signal: AbortSignal.timeout(12000)
+      }
+    );
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: 'The address search service is temporarily unavailable.'
+      });
+    }
+
+    const places = await response.json();
+
+    const results = places
+      .map((place) => ({
+        latitude: Number(place.lat),
+        longitude: Number(place.lon),
+        address: place.display_name
+      }))
+      .filter((place) =>
+        Number.isFinite(place.latitude) &&
+        Number.isFinite(place.longitude) &&
+        place.latitude >= -90 &&
+        place.latitude <= 90 &&
+        place.longitude >= -180 &&
+        place.longitude <= 180
+      );
+
+    return res.json(results);
+
+  } catch (err) {
+    console.error('Address geocoding error:', err.message);
+
+    return res.status(500).json({
+      error: 'Unable to search this address. Please try again.'
+    });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // PUBLIC COMPLAINTS (no auth needed)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -128,9 +209,9 @@ app.get('/api/complaints/public', async (req, res) => {
   if (type) { query += ' AND c.type = ?'; params.push(type); }
   if (status) { query += ' AND c.status = ?'; params.push(status); }
   if (search) { query += ' AND (c.title LIKE ? OR c.description LIKE ? OR c.location_text LIKE ?)'; params.push(`%${search}%`, `%${search}%`, `%${search}%`); }
-  query += ` ORDER BY 
+  query += ` ORDER BY
     CASE WHEN c.priority = 'High' THEN 1 WHEN c.priority = 'Medium' THEN 2 WHEN c.priority = 'Low' THEN 3 ELSE 4 END ASC,
-    upvote_count DESC, c.created_at DESC 
+    upvote_count DESC, c.created_at DESC
     LIMIT ? OFFSET ?`;
   params.push(parseInt(limit), (parseInt(page) - 1) * parseInt(limit));
   try {
@@ -162,21 +243,74 @@ app.get('/api/complaints/my', auth(['user']), async (req, res) => {
 // POST /api/complaints — submit new complaint
 app.post('/api/complaints', auth(['user']), upload.single('image'), async (req, res) => {
   const { title, description, type, location_text, latitude, longitude } = req.body;
-  if (!title || !description) return res.status(400).json({ error: 'Title and description are required' });
+
+  if (!title || !description) {
+    return res.status(400).json({ error: 'Title and description are required' });
+  }
+
+  // Validate coordinates when supplied
+  const hasCoordinates = latitude !== undefined && latitude !== '' &&
+    longitude !== undefined && longitude !== '';
+
+  if (hasCoordinates) {
+    const lat = Number(latitude);
+    const lng = Number(longitude);
+
+    if (
+      !Number.isFinite(lat) || !Number.isFinite(lng) ||
+      lat < -90 || lat > 90 || lng < -180 || lng > 180
+    ) {
+      return res.status(400).json({ error: 'Invalid location coordinates' });
+    }
+  } else {
+    return res.status(400).json({
+      error: 'Please select an address or use your GPS location before submitting.'
+    });
+  }
+
   const image_url = req.file ? `/uploads/${req.file.filename}` : null;
+
   try {
-    const aiResult = await require('./services/ai_evaluator').analyzeComplaint(title, description, type, !!req.file);
-    
+    const aiResult = await require('./services/ai_evaluator').analyzeComplaint(
+      title,
+      description,
+      type,
+      !!req.file
+    );
+
     const [result] = await pool.query(
       'INSERT INTO complaints (user_id, title, description, type, location_text, latitude, longitude, image_url, priority, is_verified, ai_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-      [req.user.id, title, description, type || 'Others', location_text || null, latitude || null, longitude || null, image_url, aiResult.priority, aiResult.isVerified, aiResult.aiReason]
+      [
+        req.user.id,
+        title,
+        description,
+        type || 'Others',
+        location_text || null,
+        hasCoordinates ? Number(latitude) : null,
+        hasCoordinates ? Number(longitude) : null,
+        image_url,
+        aiResult.priority,
+        aiResult.isVerified,
+        aiResult.aiReason
+      ]
     );
+
     // Insert initial timeline entry
     await pool.query(
       'INSERT INTO complaint_updates (complaint_id, updated_by, status, comment) VALUES (?,?,?,?)',
-      [result.insertId, req.user.id, 'Submitted', `Complaint submitted by citizen. AI Assessment: ${aiResult.emotion}`]
+      [
+        result.insertId,
+        req.user.id,
+        'Submitted',
+        `Complaint submitted by citizen. AI Assessment: ${aiResult.emotion}`
+      ]
     );
-    res.status(201).json({ message: 'Complaint submitted successfully', id: result.insertId });
+
+    res.status(201).json({
+      message: 'Complaint submitted successfully',
+      id: result.insertId
+    });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -190,7 +324,11 @@ app.get('/api/complaints/:id', auth(), async (req, res) => {
         (SELECT COUNT(*) FROM upvotes WHERE complaint_id = c.id) AS upvote_count
       FROM complaints c JOIN users u ON c.user_id = u.id WHERE c.id = ?
     `, [req.params.id]);
-    if (!rows.length) return res.status(404).json({ error: 'Complaint not found' });
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Complaint not found' });
+    }
+
     const complaint = rows[0];
 
     const [timeline] = await pool.query(`
@@ -198,6 +336,7 @@ app.get('/api/complaints/:id', auth(), async (req, res) => {
       FROM complaint_updates cu JOIN users u ON cu.updated_by = u.id
       WHERE cu.complaint_id = ? ORDER BY cu.created_at ASC
     `, [req.params.id]);
+
     complaint.timeline = timeline;
 
     const [assignment] = await pool.query(`
@@ -205,9 +344,11 @@ app.get('/api/complaints/:id', auth(), async (req, res) => {
       JOIN users u ON ca.worker_id = u.id WHERE ca.complaint_id = ?
       ORDER BY ca.assigned_at DESC LIMIT 1
     `, [req.params.id]);
+
     complaint.assignment = assignment[0] || null;
 
     res.json(complaint);
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -220,14 +361,33 @@ app.post('/api/complaints/:id/upvote', auth(['user']), async (req, res) => {
       'SELECT id FROM upvotes WHERE complaint_id = ? AND user_id = ?',
       [req.params.id, req.user.id]
     );
+
     if (existing.length) {
-      await pool.query('DELETE FROM upvotes WHERE complaint_id = ? AND user_id = ?', [req.params.id, req.user.id]);
-      await pool.query('UPDATE complaints SET upvotes = upvotes - 1 WHERE id = ? AND upvotes > 0', [req.params.id]);
+      await pool.query(
+        'DELETE FROM upvotes WHERE complaint_id = ? AND user_id = ?',
+        [req.params.id, req.user.id]
+      );
+
+      await pool.query(
+        'UPDATE complaints SET upvotes = upvotes - 1 WHERE id = ? AND upvotes > 0',
+        [req.params.id]
+      );
+
       return res.json({ upvoted: false });
     }
-    await pool.query('INSERT INTO upvotes (complaint_id, user_id) VALUES (?,?)', [req.params.id, req.user.id]);
-    await pool.query('UPDATE complaints SET upvotes = upvotes + 1 WHERE id = ?', [req.params.id]);
+
+    await pool.query(
+      'INSERT INTO upvotes (complaint_id, user_id) VALUES (?,?)',
+      [req.params.id, req.user.id]
+    );
+
+    await pool.query(
+      'UPDATE complaints SET upvotes = upvotes + 1 WHERE id = ?',
+      [req.params.id]
+    );
+
     res.json({ upvoted: true });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -251,15 +411,19 @@ app.get('/api/admin/stats', auth(['admin']), async (req, res) => {
         SUM(status='Closed') AS closed
       FROM complaints
     `);
+
     const [byType] = await pool.query(`
       SELECT type, COUNT(*) AS count FROM complaints GROUP BY type ORDER BY count DESC
     `);
+
     const [recent] = await pool.query(`
       SELECT c.id, c.title, c.type, c.status, c.created_at, u.name AS reporter
       FROM complaints c JOIN users u ON c.user_id = u.id
       ORDER BY c.created_at DESC LIMIT 5
     `);
+
     res.json({ totals, byType, recent });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -268,21 +432,41 @@ app.get('/api/admin/stats', auth(['admin']), async (req, res) => {
 // GET /api/admin/complaints
 app.get('/api/admin/complaints', auth(['admin']), async (req, res) => {
   const { type, status, search, page = 1, limit = 25 } = req.query;
+
   let query = `
     SELECT c.*, u.name AS reporter_name,
       (SELECT COUNT(*) FROM upvotes WHERE complaint_id = c.id) AS upvote_count,
-      (SELECT wu.name FROM complaint_assignments ca JOIN users wu ON ca.worker_id = wu.id WHERE ca.complaint_id = c.id ORDER BY ca.assigned_at DESC LIMIT 1) AS assigned_worker
+      (SELECT wu.name FROM complaint_assignments ca
+       JOIN users wu ON ca.worker_id = wu.id
+       WHERE ca.complaint_id = c.id
+       ORDER BY ca.assigned_at DESC LIMIT 1) AS assigned_worker
     FROM complaints c JOIN users u ON c.user_id = u.id WHERE 1=1
   `;
+
   const params = [];
-  if (type) { query += ' AND c.type = ?'; params.push(type); }
-  if (status) { query += ' AND c.status = ?'; params.push(status); }
-  if (search) { query += ' AND (c.title LIKE ? OR u.name LIKE ? OR c.location_text LIKE ?)'; params.push(`%${search}%`, `%${search}%`, `%${search}%`); }
-  query += ` ORDER BY 
+
+  if (type) {
+    query += ' AND c.type = ?';
+    params.push(type);
+  }
+
+  if (status) {
+    query += ' AND c.status = ?';
+    params.push(status);
+  }
+
+  if (search) {
+    query += ' AND (c.title LIKE ? OR u.name LIKE ? OR c.location_text LIKE ?)';
+    params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+  }
+
+  query += ` ORDER BY
     CASE WHEN c.priority = 'High' THEN 1 WHEN c.priority = 'Medium' THEN 2 WHEN c.priority = 'Low' THEN 3 ELSE 4 END ASC,
-    upvote_count DESC, c.created_at DESC 
+    upvote_count DESC, c.created_at DESC
     LIMIT ? OFFSET ?`;
+
   params.push(parseInt(limit), (parseInt(page) - 1) * parseInt(limit));
+
   try {
     const [rows] = await pool.query(query, params);
     res.json(rows);
@@ -294,7 +478,10 @@ app.get('/api/admin/complaints', auth(['admin']), async (req, res) => {
 // GET /api/admin/workers
 app.get('/api/admin/workers', auth(['admin']), async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT id, name, email, phone FROM users WHERE role = ?', ['worker']);
+    const [rows] = await pool.query(
+      'SELECT id, name, email, phone FROM users WHERE role = ?',
+      ['worker']
+    );
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -304,19 +491,39 @@ app.get('/api/admin/workers', auth(['admin']), async (req, res) => {
 // PUT /api/admin/complaints/:id/assign
 app.put('/api/admin/complaints/:id/assign', auth(['admin']), async (req, res) => {
   const { worker_id, notes } = req.body;
-  if (!worker_id) return res.status(400).json({ error: 'Worker ID required' });
+
+  if (!worker_id) {
+    return res.status(400).json({ error: 'Worker ID required' });
+  }
+
   try {
-    await pool.query('DELETE FROM complaint_assignments WHERE complaint_id = ?', [req.params.id]);
+    await pool.query(
+      'DELETE FROM complaint_assignments WHERE complaint_id = ?',
+      [req.params.id]
+    );
+
     await pool.query(
       'INSERT INTO complaint_assignments (complaint_id, worker_id, notes) VALUES (?,?,?)',
       [req.params.id, worker_id, notes || null]
     );
-    await pool.query("UPDATE complaints SET status = 'Assigned' WHERE id = ?", [req.params.id]);
+
+    await pool.query(
+      "UPDATE complaints SET status = 'Assigned' WHERE id = ?",
+      [req.params.id]
+    );
+
     await pool.query(
       'INSERT INTO complaint_updates (complaint_id, updated_by, status, comment) VALUES (?,?,?,?)',
-      [req.params.id, req.user.id, 'Assigned', `Assigned to a field worker. Notes: ${notes || 'None'}`]
+      [
+        req.params.id,
+        req.user.id,
+        'Assigned',
+        `Assigned to a field worker. Notes: ${notes || 'None'}`
+      ]
     );
+
     res.json({ message: 'Worker assigned successfully' });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -325,15 +532,38 @@ app.put('/api/admin/complaints/:id/assign', auth(['admin']), async (req, res) =>
 // PUT /api/admin/complaints/:id/status
 app.put('/api/admin/complaints/:id/status', auth(['admin']), async (req, res) => {
   const { status, comment } = req.body;
-  const validStatuses = ['Submitted', 'Verified', 'Assigned', 'In Progress', 'Completed', 'Closed'];
-  if (!validStatuses.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+
+  const validStatuses = [
+    'Submitted',
+    'Verified',
+    'Assigned',
+    'In Progress',
+    'Completed',
+    'Closed'
+  ];
+
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+
   try {
-    await pool.query('UPDATE complaints SET status = ? WHERE id = ?', [status, req.params.id]);
+    await pool.query(
+      'UPDATE complaints SET status = ? WHERE id = ?',
+      [status, req.params.id]
+    );
+
     await pool.query(
       'INSERT INTO complaint_updates (complaint_id, updated_by, status, comment) VALUES (?,?,?,?)',
-      [req.params.id, req.user.id, status, comment || `Status changed to ${status} by admin.`]
+      [
+        req.params.id,
+        req.user.id,
+        status,
+        comment || `Status changed to ${status} by admin.`
+      ]
     );
+
     res.json({ message: 'Status updated' });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -342,8 +572,13 @@ app.put('/api/admin/complaints/:id/status', auth(['admin']), async (req, res) =>
 // DELETE /api/admin/complaints/:id
 app.delete('/api/admin/complaints/:id', auth(['admin']), async (req, res) => {
   try {
-    await pool.query('DELETE FROM complaints WHERE id = ?', [req.params.id]);
+    await pool.query(
+      'DELETE FROM complaints WHERE id = ?',
+      [req.params.id]
+    );
+
     res.json({ message: 'Complaint deleted' });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -363,12 +598,14 @@ app.get('/api/worker/assigned', auth(['worker']), async (req, res) => {
       FROM complaint_assignments ca
       JOIN complaints c ON ca.complaint_id = c.id
       JOIN users u ON c.user_id = u.id
-      WHERE ca.worker_id = ? 
-      ORDER BY 
+      WHERE ca.worker_id = ?
+      ORDER BY
         CASE WHEN c.priority = 'High' THEN 1 WHEN c.priority = 'Medium' THEN 2 WHEN c.priority = 'Low' THEN 3 ELSE 4 END ASC,
         upvote_count DESC, ca.assigned_at DESC
     `, [req.user.id]);
+
     res.json(rows);
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -377,23 +614,43 @@ app.get('/api/worker/assigned', auth(['worker']), async (req, res) => {
 // PUT /api/worker/complaints/:id/update
 app.put('/api/worker/complaints/:id/update', auth(['worker']), upload.single('proof'), async (req, res) => {
   const { status, comment } = req.body;
+
   const validStatuses = ['In Progress', 'Completed'];
-  if (!validStatuses.includes(status)) return res.status(400).json({ error: 'Invalid status for worker' });
+
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ error: 'Invalid status for worker' });
+  }
+
   const proof_url = req.file ? `/uploads/${req.file.filename}` : null;
+
   try {
-    await pool.query('UPDATE complaints SET status = ? WHERE id = ?', [status, req.params.id]);
+    await pool.query(
+      'UPDATE complaints SET status = ? WHERE id = ?',
+      [status, req.params.id]
+    );
+
     await pool.query(
       'INSERT INTO complaint_updates (complaint_id, updated_by, status, comment, proof_image_url) VALUES (?,?,?,?,?)',
-      [req.params.id, req.user.id, status, comment || `Status updated to ${status}.`, proof_url]
+      [
+        req.params.id,
+        req.user.id,
+        status,
+        comment || `Status updated to ${status}.`,
+        proof_url
+      ]
     );
+
     res.json({ message: 'Complaint status updated' });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // Health check
-app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date() }));
+app.get('/api/health', (req, res) =>
+  res.json({ status: 'ok', time: new Date() })
+);
 
 app.listen(PORT, () => {
   console.log(`🚀 CivicTrack server running on http://localhost:${PORT}`);
